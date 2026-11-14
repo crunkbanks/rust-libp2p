@@ -167,7 +167,11 @@ pub enum Event {
         renewed: bool,
     },
     /// Accepting an inbound reservation request failed.
-    ReservationReqAcceptFailed { error: inbound_hop::Error },
+    ReservationReqAcceptFailed {
+        error: inbound_hop::Error,
+        /// Whether the connection still holds the reservation the request would have renewed.
+        still_reserved: bool,
+    },
     /// An inbound reservation request has been denied.
     ReservationReqDenied { status: proto::Status },
     /// Denying an inbound reservation request has failed.
@@ -245,9 +249,13 @@ impl fmt::Debug for Event {
                 .debug_struct("Event::ReservationReqAccepted")
                 .field("renewed", renewed)
                 .finish(),
-            Event::ReservationReqAcceptFailed { error } => f
+            Event::ReservationReqAcceptFailed {
+                error,
+                still_reserved,
+            } => f
                 .debug_struct("Event::ReservationReqAcceptFailed")
                 .field("error", error)
+                .field("still_reserved", still_reserved)
                 .finish(),
             Event::ReservationReqDenied { status } => f
                 .debug_struct("Event::ReservationReqDenied")
@@ -558,18 +566,29 @@ impl ConnectionHandler for Handler {
                 inbound_reservation_req,
                 status,
             } => {
-                if self
-                    .reservation_request_future
-                    .replace(ReservationRequestFuture::Denying(
-                        inbound_reservation_req
-                            .deny(status)
-                            .err_into()
-                            .map(move |result| (status, result))
-                            .boxed(),
-                    ))
-                    .is_some()
-                {
-                    tracing::warn!("Dropping existing deny/accept future in favor of new one")
+                let replaced =
+                    self.reservation_request_future
+                        .replace(ReservationRequestFuture::Denying(
+                            inbound_reservation_req
+                                .deny(status)
+                                .err_into()
+                                .map(move |result| (status, result))
+                                .boxed(),
+                        ));
+                if let Some(replaced) = replaced {
+                    tracing::warn!("Dropping existing deny/accept future in favor of new one");
+                    // An acceptance dropped here never reaches the peer. Report it as failed so
+                    // that the behaviour forgets the reservation it recorded for it. (One replaced
+                    // by another acceptance is decided by that one.)
+                    if matches!(replaced, ReservationRequestFuture::Accepting(_)) {
+                        self.queued_events
+                            .push_back(ConnectionHandlerEvent::NotifyBehaviour(
+                                Event::ReservationReqAcceptFailed {
+                                    error: inbound_hop::Error::StreamClosed,
+                                    still_reserved: self.active_reservation.is_some(),
+                                },
+                            ));
+                    }
                 }
             }
             In::NegotiateOutboundConnect {
@@ -879,7 +898,10 @@ impl ConnectionHandler for Handler {
                         }
                         Err(error) => {
                             return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
-                                Event::ReservationReqAcceptFailed { error },
+                                Event::ReservationReqAcceptFailed {
+                                    error,
+                                    still_reserved: self.active_reservation.is_some(),
+                                },
                             ));
                         }
                     }

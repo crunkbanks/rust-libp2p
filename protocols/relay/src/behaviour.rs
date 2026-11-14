@@ -404,6 +404,22 @@ impl Behaviour {
         }
     }
 
+    /// Ends the reservation of `peer` on `connection`, keeping the connection tracked. Returns
+    /// whether there was an active reservation.
+    fn end_reservation(&mut self, peer: PeerId, connection: ConnectionId) -> bool {
+        match self
+            .connections
+            .get_mut(&peer)
+            .and_then(|cs| cs.get_mut(&connection))
+        {
+            Some(reservation) if reservation.is_active() => {
+                *reservation = Reservation::None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn on_connection_established(
         &mut self,
         ConnectionEstablished {
@@ -619,10 +635,11 @@ impl NetworkBehaviour for Behaviour {
             }
             handler::Event::ReservationReqAccepted { renewed } => {
                 // Ensure local eventual consistent reservation state matches handler (source of
-                // truth).
+                // truth). A renewal accepted right after the reservation it renews timed out finds
+                // the connection without a reservation (see `ReservationTimedOut`), but tracked.
                 self.connections
-                    .get_mut(&event_source)
-                    .expect("valid connection")
+                    .entry(event_source)
+                    .or_default()
                     .insert(connection, Reservation::Active);
 
                 self.queued_actions.push_back(ToSwarm::GenerateEvent(
@@ -632,7 +649,16 @@ impl NetworkBehaviour for Behaviour {
                     },
                 ));
             }
-            handler::Event::ReservationReqAcceptFailed { error } => {
+            handler::Event::ReservationReqAcceptFailed {
+                error,
+                still_reserved,
+            } => {
+                // The reservation was recorded when the request was accepted. A new reservation
+                // that never reached the peer is no reservation and nothing would ever time it
+                // out, whereas a failed renewal leaves the reservation it would have renewed.
+                if !still_reserved {
+                    self.end_reservation(event_source, connection);
+                }
                 #[allow(deprecated)]
                 self.queued_actions.push_back(ToSwarm::GenerateEvent(
                     Event::ReservationReqAcceptFailed {
@@ -659,19 +685,15 @@ impl NetworkBehaviour for Behaviour {
                 ));
             }
             handler::Event::ReservationTimedOut {} => {
-                match self.connections.entry(event_source) {
-                    hash_map::Entry::Occupied(mut peer) => {
-                        peer.get_mut().remove(&connection);
-                        if peer.get().is_empty() {
-                            peer.remove();
-                        }
-                    }
-                    hash_map::Entry::Vacant(_) => {
-                        unreachable!(
-                            "Expect to track timed out reservation with peer {:?} on connection {:?}",
-                            event_source, connection,
-                        );
-                    }
+                // The reservation ends, the connection stays tracked. A reservation is ended when
+                // it times out, when its acceptance fails or with its connection, so one that is
+                // no longer active is no reason to panic.
+                if !self.end_reservation(event_source, connection) {
+                    tracing::debug!(
+                        peer=%event_source,
+                        ?connection,
+                        "Timed out reservation is not active"
+                    );
                 }
 
                 self.queued_actions
@@ -1002,5 +1024,132 @@ impl From<proto::Status> for StatusCode {
             proto::Status::MalformedMessage => Self::MalformedMessage,
             proto::Status::UnexpectedMessage => Self::UnexpectedMessage,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connected(behaviour: &mut Behaviour, peer: PeerId, connection: ConnectionId) {
+        let endpoint = ConnectedPoint::Listener {
+            local_addr: Multiaddr::empty(),
+            send_back_addr: Multiaddr::empty(),
+        };
+        behaviour.on_swarm_event(FromSwarm::ConnectionEstablished(ConnectionEstablished {
+            peer_id: peer,
+            connection_id: connection,
+            endpoint: &endpoint,
+            failed_addresses: &[],
+            other_established: 0,
+        }));
+    }
+
+    fn handler_event(
+        behaviour: &mut Behaviour,
+        peer: PeerId,
+        connection: ConnectionId,
+        event: handler::Event,
+    ) {
+        behaviour.on_connection_handler_event(peer, connection, Either::Left(event));
+    }
+
+    fn reservation<'a>(
+        behaviour: &'a Behaviour,
+        peer: &PeerId,
+        connection: &ConnectionId,
+    ) -> Option<&'a Reservation> {
+        behaviour
+            .connections
+            .get(peer)
+            .and_then(|connections| connections.get(connection))
+    }
+
+    #[test]
+    fn renewal_accepted_after_reservation_timed_out_does_not_panic() {
+        let mut behaviour = Behaviour::new(PeerId::random(), Config::default());
+        let peer = PeerId::random();
+        let connection = ConnectionId::new_unchecked(1);
+        connected(&mut behaviour, peer, connection);
+        handler_event(
+            &mut behaviour,
+            peer,
+            connection,
+            handler::Event::ReservationReqAccepted { renewed: false },
+        );
+
+        // The handler polls its reservation timer before the acceptance of a renewal that the
+        // behaviour accepted in the meantime: the timeout is reported first.
+        handler_event(
+            &mut behaviour,
+            peer,
+            connection,
+            handler::Event::ReservationTimedOut {},
+        );
+        assert_eq!(
+            reservation(&behaviour, &peer, &connection),
+            Some(&Reservation::None),
+            "the connection stays tracked without a reservation"
+        );
+
+        handler_event(
+            &mut behaviour,
+            peer,
+            connection,
+            handler::Event::ReservationReqAccepted { renewed: false },
+        );
+        assert_eq!(
+            reservation(&behaviour, &peer, &connection),
+            Some(&Reservation::Active)
+        );
+    }
+
+    #[test]
+    fn failed_acceptance_of_new_reservation_removes_it() {
+        let mut behaviour = Behaviour::new(PeerId::random(), Config::default());
+        let peer = PeerId::random();
+        let connection = ConnectionId::new_unchecked(1);
+        connected(&mut behaviour, peer, connection);
+
+        // The behaviour records a reservation as soon as it accepts the request.
+        behaviour
+            .connections
+            .get_mut(&peer)
+            .unwrap()
+            .insert(connection, Reservation::Active);
+        handler_event(
+            &mut behaviour,
+            peer,
+            connection,
+            handler::Event::ReservationReqAcceptFailed {
+                error: inbound_hop::Error::StreamClosed,
+                still_reserved: false,
+            },
+        );
+        assert_eq!(
+            reservation(&behaviour, &peer, &connection),
+            Some(&Reservation::None),
+            "a reservation that never reached the peer is no reservation"
+        );
+
+        // A failed renewal keeps the reservation it would have renewed.
+        behaviour
+            .connections
+            .get_mut(&peer)
+            .unwrap()
+            .insert(connection, Reservation::Active);
+        handler_event(
+            &mut behaviour,
+            peer,
+            connection,
+            handler::Event::ReservationReqAcceptFailed {
+                error: inbound_hop::Error::StreamClosed,
+                still_reserved: true,
+            },
+        );
+        assert_eq!(
+            reservation(&behaviour, &peer, &connection),
+            Some(&Reservation::Active)
+        );
     }
 }

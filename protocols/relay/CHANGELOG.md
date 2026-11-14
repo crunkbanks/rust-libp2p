@@ -9,6 +9,13 @@
   instead of keeping it pending until the connection closes.
   See [PR 6647](https://github.com/libp2p/rust-libp2p/pull/6647).
 
+- Fix a panic of the relay server when a reservation renewal is accepted right after the
+  reservation it renews timed out, and keep the reservation table exact: a timed out reservation
+  ends while its connection stays tracked, and a new reservation whose acceptance failed to reach
+  the peer (or was replaced by a denial) no longer stays active without a timer until its
+  connection closes.
+  See [PR XXXX](https://github.com/libp2p/rust-libp2p/pull/XXXX).
+
 <!-- Update to libp2p-swarm v0.49.0 -->
 
 ## 0.22.0
