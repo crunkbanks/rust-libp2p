@@ -1121,3 +1121,85 @@ async fn closing_listener_before_reservation_is_accepted_does_not_panic() {
         }
     }
 }
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn reservation_closed_only_for_connection_with_reservation() {
+    let relay_addr = Multiaddr::empty().with(Protocol::Memory(rand::random::<u64>()));
+    let mut relay = build_relay_with_config(relay::Config {
+        reservation_duration: Duration::from_secs(3600),
+        ..relay::Config::default()
+    });
+    let relay_peer_id = *relay.local_peer_id();
+    relay.listen_on(relay_addr.clone()).unwrap();
+    relay.add_external_address(relay_addr.clone());
+
+    // A peer that connects to the relay without making a reservation.
+    let mut plain = build_client();
+    plain
+        .dial(relay_addr.clone().with(Protocol::P2p(relay_peer_id)))
+        .unwrap();
+    loop {
+        tokio::select! {
+            e = plain.select_next_some() => {
+                if let SwarmEvent::ConnectionEstablished { peer_id, .. } = e
+                    && peer_id == relay_peer_id
+                {
+                    break;
+                }
+            }
+            _ = relay.select_next_some() => {}
+        }
+    }
+
+    // A peer that makes a reservation.
+    let mut reserving = build_client();
+    let reserving_peer_id = *reserving.local_peer_id();
+    reserving
+        .listen_on(
+            relay_addr
+                .with(Protocol::P2p(relay_peer_id))
+                .with(Protocol::P2pCircuit),
+        )
+        .unwrap();
+    let mut reserved = false;
+    while !reserved {
+        tokio::select! {
+            e = reserving.select_next_some() => {
+                if let SwarmEvent::Behaviour(ClientEvent::Relay(
+                    relay::client::Event::ReservationReqAccepted { .. },
+                )) = e
+                {
+                    reserved = true;
+                }
+            }
+            _ = plain.select_next_some() => {}
+            _ = relay.select_next_some() => {}
+        }
+    }
+
+    // Both go away.
+    drop(plain);
+    drop(reserving);
+
+    let mut closed = Vec::new();
+    let mut deadline = futures_timer::Delay::new(Duration::from_secs(2));
+    loop {
+        tokio::select! {
+            e = relay.select_next_some() => {
+                if let SwarmEvent::Behaviour(RelayEvent::Relay(relay::Event::ReservationClosed {
+                    src_peer_id,
+                })) = e
+                {
+                    closed.push(src_peer_id);
+                }
+            }
+            _ = &mut deadline => break,
+        }
+    }
+    assert_eq!(
+        closed,
+        vec![reserving_peer_id],
+        "only the connection that held a reservation closes one"
+    );
+}

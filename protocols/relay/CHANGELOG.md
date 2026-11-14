@@ -9,6 +9,11 @@
   instead of keeping it pending until the connection closes.
   See [PR 6647](https://github.com/libp2p/rust-libp2p/pull/6647).
 
+- Emit `Event::ReservationClosed` only when a connection that held an active reservation closes.
+  Since all connections are tracked, it was emitted for every closed connection, with or without a
+  reservation.
+  See [PR XXXX](https://github.com/libp2p/rust-libp2p/pull/XXXX).
+
 <!-- Update to libp2p-swarm v0.49.0 -->
 
 ## 0.22.0

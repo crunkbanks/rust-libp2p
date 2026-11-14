@@ -427,7 +427,8 @@ impl Behaviour {
         }: ConnectionClosed,
     ) {
         if let hash_map::Entry::Occupied(mut peer) = self.connections.entry(peer_id) {
-            if peer.get_mut().remove(&connection_id).is_some() {
+            // Every connection of a peer is tracked, only one that holds a reservation closes one.
+            if peer.get_mut().remove(&connection_id) == Some(Reservation::Active) {
                 self.queued_actions
                     .push_back(ToSwarm::GenerateEvent(Event::ReservationClosed {
                         src_peer_id: peer_id,
