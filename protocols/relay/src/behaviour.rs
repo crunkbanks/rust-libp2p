@@ -833,12 +833,17 @@ impl NetworkBehaviour for Behaviour {
                 dst_peer_id,
                 circuit_id,
             } => {
-                self.circuits.accepted(circuit_id);
-                self.queued_actions
-                    .push_back(ToSwarm::GenerateEvent(Event::CircuitReqAccepted {
-                        src_peer_id: event_source,
-                        dst_peer_id,
-                    }));
+                // A circuit that is no longer tracked was removed when one of its connections
+                // closed while it was being accepted. It is going away, so neither its acceptance
+                // nor its closure is reported.
+                if self.circuits.accepted(circuit_id) {
+                    self.queued_actions.push_back(ToSwarm::GenerateEvent(
+                        Event::CircuitReqAccepted {
+                            src_peer_id: event_source,
+                            dst_peer_id,
+                        },
+                    ));
+                }
             }
             handler::Event::CircuitReqAcceptFailed {
                 dst_peer_id,
@@ -860,14 +865,17 @@ impl NetworkBehaviour for Behaviour {
                 circuit_id,
                 error,
             } => {
-                self.circuits.remove(circuit_id);
-
-                self.queued_actions
-                    .push_back(ToSwarm::GenerateEvent(Event::CircuitClosed {
-                        src_peer_id: event_source,
-                        dst_peer_id,
-                        error,
-                    }));
+                // A circuit that is no longer tracked was already reported as closed when one of
+                // its connections closed (see `on_connection_closed`). The source's handler reports
+                // the end of its copy of the circuit afterwards, which must not be reported again.
+                if self.circuits.remove(circuit_id).is_some() {
+                    self.queued_actions
+                        .push_back(ToSwarm::GenerateEvent(Event::CircuitClosed {
+                            src_peer_id: event_source,
+                            dst_peer_id,
+                            error,
+                        }));
+                }
             }
         }
     }
@@ -907,10 +915,15 @@ impl CircuitsTracker {
         id
     }
 
-    fn accepted(&mut self, circuit_id: CircuitId) {
-        if let Some(c) = self.circuits.get_mut(&circuit_id) {
-            c.status = CircuitStatus::Accepted;
-        };
+    /// Marks the circuit as accepted. Returns `false` if the circuit is no longer tracked.
+    fn accepted(&mut self, circuit_id: CircuitId) -> bool {
+        match self.circuits.get_mut(&circuit_id) {
+            Some(c) => {
+                c.status = CircuitStatus::Accepted;
+                true
+            }
+            None => false,
+        }
     }
 
     fn remove(&mut self, circuit_id: CircuitId) -> Option<Circuit> {

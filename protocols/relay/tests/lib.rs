@@ -1121,3 +1121,93 @@ async fn closing_listener_before_reservation_is_accepted_does_not_panic() {
         }
     }
 }
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn circuit_is_reported_closed_once_when_destination_disconnects() {
+    let relay_addr = Multiaddr::empty().with(Protocol::Memory(rand::random::<u64>()));
+    let mut relay = build_relay_with_config(relay::Config {
+        reservation_duration: Duration::from_secs(3600),
+        ..relay::Config::default()
+    });
+    let relay_peer_id = *relay.local_peer_id();
+    relay.listen_on(relay_addr.clone()).unwrap();
+    relay.add_external_address(relay_addr.clone());
+
+    let mut dst = build_client();
+    let dst_peer_id = *dst.local_peer_id();
+    let dst_addr = relay_addr
+        .with(Protocol::P2p(relay_peer_id))
+        .with(Protocol::P2pCircuit)
+        .with(Protocol::P2p(dst_peer_id));
+    dst.listen_on(dst_addr.clone()).unwrap();
+    let mut reserved = false;
+    while !reserved {
+        tokio::select! {
+            e = dst.select_next_some() => {
+                if let SwarmEvent::Behaviour(ClientEvent::Relay(
+                    relay::client::Event::ReservationReqAccepted { .. },
+                )) = e
+                {
+                    reserved = true;
+                }
+            }
+            _ = relay.select_next_some() => {}
+        }
+    }
+
+    let mut src = build_client();
+    let src_peer_id = *src.local_peer_id();
+    src.dial(dst_addr).unwrap();
+    let (mut accepted, mut connected) = (false, false);
+    let mut deadline = futures_timer::Delay::new(Duration::from_secs(20));
+    while !(accepted && connected) {
+        tokio::select! {
+            e = relay.select_next_some() => {
+                if let SwarmEvent::Behaviour(RelayEvent::Relay(
+                    relay::Event::CircuitReqAccepted { .. },
+                )) = e
+                {
+                    accepted = true;
+                }
+            }
+            e = src.select_next_some() => {
+                if let SwarmEvent::ConnectionEstablished { peer_id, .. } = e
+                    && peer_id == dst_peer_id
+                {
+                    connected = true;
+                }
+            }
+            _ = dst.select_next_some() => {}
+            _ = &mut deadline => panic!("circuit was never established"),
+        }
+    }
+
+    // The destination goes away. The relay removes the circuit along with the destination's
+    // connection, and the source's handler sees its copy of the circuit end afterwards.
+    drop(dst);
+
+    let mut closed = 0;
+    let mut deadline = futures_timer::Delay::new(Duration::from_secs(2));
+    loop {
+        tokio::select! {
+            e = relay.select_next_some() => {
+                if let SwarmEvent::Behaviour(RelayEvent::Relay(relay::Event::CircuitClosed {
+                    src_peer_id: s,
+                    dst_peer_id: d,
+                    ..
+                })) = e
+                {
+                    assert_eq!((s, d), (src_peer_id, dst_peer_id));
+                    closed += 1;
+                }
+            }
+            _ = src.select_next_some() => {}
+            _ = &mut deadline => break,
+        }
+    }
+    assert_eq!(
+        closed, 1,
+        "the circuit must be reported as closed exactly once"
+    );
+}
